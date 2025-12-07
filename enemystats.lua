@@ -12,6 +12,11 @@ local settings = require('settings');
 local default_settings = T {
     visible = true,
     debug = true, -- Enable debug prints (set to false to reduce chat spam)
+    -- NM (Notorious Monster) stat multipliers
+    -- These allow adjusting calculated stats for NMs to match your server's settings
+    -- Default is 1.0 (no modification) - matches server defaults
+    nm_hp_multiplier = 1.0,   -- HP multiplier for NMs (e.g., 1.5 = 50% more HP)
+    nm_stat_multiplier = 1.0, -- ATK/DEF/EVA multiplier for NMs
 };
 
 local database = require('database');
@@ -21,8 +26,19 @@ local textures = require('textures');
 -- Cache for exact mob levels (from widescan and /check)
 local mobLevels = T {};
 
+-- Cache for mobs that were /checked but returned ITG (impossible to gauge)
+-- For these, we'll use the database MaxLevel as the "exact" level
+local mobCheckedITG = T {};
+
 -- Cache for mob claim status (from entity update packets)
 local mobClaims = T {};
+
+-- Cache for last "mob not found" debug message to avoid spam (d3d_present runs every frame)
+local lastNotFoundMsg = T {
+    name = nil,
+    index = nil,
+    time = 0,
+};
 
 -- Cache for player's real ACC/ATT/EVA/DEF from /checkparam
 -- These values include ALL modifiers (gear, food, buffs, merits, etc.)
@@ -74,6 +90,11 @@ local function update_settings(s)
     if (s ~= nil) then
         enemystats.settings = s;
     end
+    -- Update calculator with NM multiplier settings
+    calculator.SetSettings({
+        nm_hp_multiplier = enemystats.settings.nm_hp_multiplier or 1.0,
+        nm_stat_multiplier = enemystats.settings.nm_stat_multiplier or 1.0,
+    });
     settings.save();
 end
 
@@ -409,6 +430,11 @@ end
 -- Load database for current zone on load
 ashita.events.register('load', 'load_cb', function()
     textures:Initialize();
+    -- Initialize calculator with NM multiplier settings
+    calculator.SetSettings({
+        nm_hp_multiplier = enemystats.settings.nm_hp_multiplier or 1.0,
+        nm_stat_multiplier = enemystats.settings.nm_stat_multiplier or 1.0,
+    });
     local zone = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
     database:Load(zone);
 end);
@@ -418,6 +444,7 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
     -- Zone Enter / Zone Leave - clear level cache, claim cache, and player stats cache
     if (e.id == 0x000A or e.id == 0x000B) then
         mobLevels:clear();
+        mobCheckedITG:clear();
         mobClaims:clear();
         -- Clear player stats cache on zone (gear/buffs may change)
         playerStats.ACC = nil;
@@ -543,8 +570,18 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
             -- Check if this is a /check message (types 0x40-0x47, or 0xF9 for impossible)
         elseif ((p2 >= 0x40 and p2 <= 0x47) or m == 0xF9) then
             local targetIdx = struct.unpack('H', e.data, 0x16 + 0x01);
-            if (p1 > 0 and targetIdx > 0) then
-                mobLevels[targetIdx] = p1;
+            if (targetIdx > 0) then
+                if (p1 > 0) then
+                    -- Normal /check - got actual level
+                    mobLevels[targetIdx] = p1;
+                    mobCheckedITG[targetIdx] = nil; -- Clear ITG flag if previously set
+                    dbg(string.format('[enemystats] /check captured level %d for index %d', p1, targetIdx));
+                elseif (m == 0xF9 or p2 == 0x40) then
+                    -- ITG (impossible to gauge) - mark as checked, will use DB level
+                    -- Message 0xF9 = "Impossible to gauge!", p2=0x40 also indicates ITG
+                    mobCheckedITG[targetIdx] = true;
+                    dbg(string.format('[enemystats] /check ITG for index %d - will use DB level', targetIdx));
+                end
             end
         end
         return;
@@ -619,6 +656,34 @@ ashita.events.register('d3d_present', 'present_cb', function()
         local mobName = entMgr:GetName(index) or 'Unknown';
         local dist = math.sqrt(entMgr:GetDistance(index));
         local dbMob = database:GetMob(index);
+        local lookupMethod = 'index';
+
+        -- Fallback: If mob not found by index, try by name (for dynamically spawned NMs)
+        if (not dbMob) then
+            dbMob = database:GetMobByName(mobName);
+            if (dbMob) then
+                lookupMethod = dbMob._fromPool and 'pool' or 'name';
+                if (enemystats.settings.debug) then
+                    -- Only print success message once per mob
+                    if (lastNotFoundMsg.name ~= mobName or lastNotFoundMsg.index ~= index) then
+                        dbg(string.format('[enemystats] Mob found by %s: %s (index %d)', lookupMethod, mobName, index));
+                    end
+                end
+                -- Clear the "not found" cache since we found it
+                lastNotFoundMsg.name = nil;
+                lastNotFoundMsg.index = nil;
+            elseif (enemystats.settings.debug) then
+                -- Only print NOT FOUND once per mob (not every frame)
+                local now = os.clock();
+                if (lastNotFoundMsg.name ~= mobName or lastNotFoundMsg.index ~= index or now - lastNotFoundMsg.time > 5.0) then
+                    dbg(string.format('[enemystats] Mob NOT FOUND: %s (index %d, zone %d)', mobName, index,
+                        database.CurrentZone));
+                    lastNotFoundMsg.name = mobName;
+                    lastNotFoundMsg.index = index;
+                    lastNotFoundMsg.time = now;
+                end
+            end
+        end
 
         -- Line 1: Distance (XX.X format, 00.0 to 50.0) with background highlight
         local clampedDist = math.min(dist, 50.0);
@@ -705,10 +770,28 @@ ashita.events.register('d3d_present', 'present_cb', function()
             -- Level display
             local exactLevel = mobLevels[index];
             local calcLevel;
+            local isEstimated = dbMob._fromPool; -- Data from pool lookup (estimated)
+            local isITG = mobCheckedITG[index];  -- Was /checked but returned "Impossible to gauge"
+
             if (exactLevel and exactLevel > 0) then
+                -- Got exact level from /check or widescan
                 imgui.Text(string.format('LVL %03d', exactLevel));
                 calcLevel = exactLevel;
+            elseif (isITG) then
+                -- ITG mob was /checked - use database MaxLevel as the "known" level
+                -- Show with special indicator that it's from DB after ITG check
+                imgui.TextColored({ 1.0, 0.6, 0.2, 1.0 }, string.format('LVL %03d', dbMob.MaxLevel));
+                calcLevel = dbMob.MaxLevel;
+            elseif (isEstimated) then
+                -- Pool data: show as estimate with ~ prefix
+                imgui.TextColored({ 0.8, 0.8, 0.5, 1.0 }, string.format('LVL ~%d', dbMob.MaxLevel));
+                calcLevel = dbMob.MaxLevel;
+            elseif (dbMob.MinLevel == dbMob.MaxLevel) then
+                -- Single level mob (not a range) - show without range
+                imgui.Text(string.format('LVL %03d', dbMob.MaxLevel));
+                calcLevel = dbMob.MaxLevel;
             else
+                -- Show level range (not yet /checked)
                 imgui.Text(string.format('LVL %d-%d', dbMob.MinLevel, dbMob.MaxLevel));
                 calcLevel = dbMob.MaxLevel;
             end
@@ -723,9 +806,10 @@ ashita.events.register('d3d_present', 'present_cb', function()
             imgui.ProgressBar(hpFraction, { 150, 16 }, tostring(hp));
             imgui.PopStyleColor(1);
 
-            -- HP number on right
+            -- HP number on right - show exact if we have exact level OR ITG was checked
+            local hasExactLevel = (exactLevel and exactLevel > 0) or isITG or (dbMob.MinLevel == dbMob.MaxLevel);
             imgui.SameLine(0, 10);
-            if (exactLevel and exactLevel > 0) then
+            if (hasExactLevel) then
                 imgui.Text(string.format('HP: %d', maxHP));
             else
                 imgui.Text(string.format('HP: ~%d', maxHP));
@@ -733,7 +817,7 @@ ashita.events.register('d3d_present', 'present_cb', function()
 
             -- Combat stats line (ATK, DEF, EVA) - always shown
             local combatStats = calculator.CalculateCombatStats(dbMob, calcLevel, stats);
-            if (exactLevel and exactLevel > 0) then
+            if (hasExactLevel) then
                 imgui.Text(string.format('ATK: %d   DEF: %d   EVA: %d', combatStats.ATK, combatStats.DEF, combatStats
                     .EVA));
             else
@@ -994,6 +1078,10 @@ ashita.events.register('d3d_present', 'present_cb', function()
             end
         else
             imgui.TextColored({ 1.0, 1.0, 0.5, 1.0 }, 'No DB Data');
+            if (enemystats.settings.debug) then
+                imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, string.format('Idx: %d, Zone: %d', index, database.CurrentZone));
+                imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, string.format('Name: %s', mobName));
+            end
         end
 
         imgui.End();
@@ -1030,7 +1118,7 @@ ashita.events.register('command', 'command_cb', function(e)
             -- Show current status
             if (playerStats.ACC2 and playerStats.ACC2 > 0) then
                 print('[enemystats] Main ACC: ' ..
-                tostring(playerStats.ACC) .. ', Off ACC: ' .. tostring(playerStats.ACC2));
+                    tostring(playerStats.ACC) .. ', Off ACC: ' .. tostring(playerStats.ACC2));
             else
                 print('[enemystats] Current ACC: ' .. tostring(playerStats.ACC));
             end
@@ -1045,6 +1133,132 @@ ashita.events.register('command', 'command_cb', function(e)
             -- Toggle debug mode
             enemystats.settings.debug = not enemystats.settings.debug;
             print('[enemystats] Debug mode: ' .. (enemystats.settings.debug and 'ON' or 'OFF'));
+        elseif (args[2] == 'dump') then
+            -- Dump loaded mob data for debugging
+            print('[enemystats] Current zone: ' .. tostring(database.CurrentZone));
+            local count = 0;
+            if (database.Mobs) then
+                for idx, mob in pairs(database.Mobs) do
+                    count = count + 1;
+                    if (count <= 10) then
+                        print(string.format('  [%d] %s (Lv%d-%d)', idx, mob.Name or '?', mob.MinLevel or 0,
+                            mob.MaxLevel or 0));
+                    end
+                end
+            end
+            print('[enemystats] Total mobs loaded: ' .. count);
+            -- Also show pool count
+            local poolCount = 0;
+            if (database.PoolsByName) then
+                for _ in pairs(database.PoolsByName) do poolCount = poolCount + 1; end
+            end
+            print('[enemystats] Pools loaded: ' .. poolCount);
+        elseif (args[2] == 'find') then
+            -- Search for a mob by name
+            if (args[3]) then
+                local searchName = args[3]:lower();
+                print('[enemystats] Searching for: ' .. searchName);
+                local found = false;
+                if (database.Mobs) then
+                    for idx, mob in pairs(database.Mobs) do
+                        if (mob.Name and mob.Name:lower():find(searchName)) then
+                            print(string.format('  FOUND in Mobs[%d]: %s (Lv%d-%d)', idx, mob.Name, mob.MinLevel or 0,
+                                mob.MaxLevel or 0));
+                            found = true;
+                        end
+                    end
+                end
+                if (database.PoolsByName) then
+                    for name, pool in pairs(database.PoolsByName) do
+                        if (name:lower():find(searchName)) then
+                            print(string.format('  FOUND in Pools: %s (poolid=%d)', name, pool.PoolId or 0));
+                            found = true;
+                        end
+                    end
+                end
+                if (not found) then
+                    print('[enemystats] Not found in database');
+                end
+            else
+                print('[enemystats] Usage: /enemystats find <name>');
+            end
+        elseif (args[2] == 'test') then
+            -- Test GetMobByName with current target
+            local target = AshitaCore:GetMemoryManager():GetTarget();
+            if (target) then
+                local index = target:GetTargetIndex(0);
+                local entMgr = AshitaCore:GetMemoryManager():GetEntity();
+                if (entMgr and index > 0) then
+                    local mobName = entMgr:GetName(index);
+                    print('[enemystats] Testing name lookup for: "' .. tostring(mobName) .. '"');
+                    print('[enemystats] Target index: ' .. index);
+
+                    -- Test direct index lookup
+                    local byIndex = database:GetMob(index);
+                    print('[enemystats] GetMob(' .. index .. '): ' .. (byIndex and byIndex.Name or 'nil'));
+
+                    -- Test name lookup
+                    local byName = database:GetMobByName(mobName);
+                    if (byName) then
+                        print('[enemystats] GetMobByName: FOUND - ' ..
+                            byName.Name .. ' (Lv' .. byName.MinLevel .. '-' .. byName.MaxLevel .. ')');
+                        print('[enemystats]   fromPool: ' .. tostring(byName._fromPool));
+                        print('[enemystats]   IsNM: ' .. tostring(byName.IsNM));
+                        print('[enemystats]   HPOverride: ' .. tostring(byName.HPOverride or 0));
+                    else
+                        print('[enemystats] GetMobByName: NOT FOUND');
+                        -- Debug: show what the search would look like
+                        local searchName = mobName:gsub('_', ' '):lower();
+                        print('[enemystats] Normalized search: "' .. searchName .. '"');
+                        -- Try to find close matches
+                        local closeMatches = 0;
+                        if (database.Mobs) then
+                            for idx, mob in pairs(database.Mobs) do
+                                if (mob.Name) then
+                                    local mobNameNorm = mob.Name:gsub('_', ' '):lower();
+                                    if (mobNameNorm:find(searchName:sub(1, 8)) or searchName:find(mobNameNorm:sub(1, 8))) then
+                                        closeMatches = closeMatches + 1;
+                                        if (closeMatches <= 3) then
+                                            print('[enemystats] Close match: "' .. mobNameNorm .. '" at idx ' .. idx);
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                else
+                    print('[enemystats] No target or invalid index');
+                end
+            else
+                print('[enemystats] No target');
+            end
+        elseif (args[2] == 'nm' or args[2] == 'multiplier') then
+            -- View or set NM multipliers
+            if (args[3] == 'hp' and args[4]) then
+                local val = tonumber(args[4]);
+                if (val and val > 0) then
+                    enemystats.settings.nm_hp_multiplier = val;
+                    calculator.SetSettings({ nm_hp_multiplier = val });
+                    print(string.format('[enemystats] NM HP multiplier set to %.2f', val));
+                else
+                    print('[enemystats] Invalid value. Usage: /enemystats nm hp <number>');
+                end
+            elseif (args[3] == 'stat' and args[4]) then
+                local val = tonumber(args[4]);
+                if (val and val > 0) then
+                    enemystats.settings.nm_stat_multiplier = val;
+                    calculator.SetSettings({ nm_stat_multiplier = val });
+                    print(string.format('[enemystats] NM stat multiplier set to %.2f', val));
+                else
+                    print('[enemystats] Invalid value. Usage: /enemystats nm stat <number>');
+                end
+            else
+                -- Show current values
+                print(string.format('[enemystats] NM HP multiplier: %.2f', enemystats.settings.nm_hp_multiplier or 1.0));
+                print(string.format('[enemystats] NM stat multiplier: %.2f',
+                    enemystats.settings.nm_stat_multiplier or 1.0));
+                print('[enemystats] Usage: /enemystats nm hp <value> | /enemystats nm stat <value>');
+            end
         end
         update_settings();
     else
@@ -1055,6 +1269,10 @@ ashita.events.register('command', 'command_cb', function(e)
         print('  /enemystats refresh - Manually update ACC/ATT/EVA/DEF');
         print('  /enemystats status  - Show current tracking status');
         print('  /enemystats debug   - Toggle debug prints on/off');
+        print('  /enemystats dump    - Show loaded mob data');
+        print('  /enemystats find <name> - Search for a mob by name');
+        print('  /enemystats test    - Test name lookup on current target');
+        print('  /enemystats nm [hp|stat] [value] - View/set NM multipliers');
         print('[enemystats] Note: ACC auto-updates on buff/gear changes. Gear sets are cached for instant swaps.');
     end
 end);

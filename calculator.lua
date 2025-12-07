@@ -2,6 +2,23 @@ local grades = require('grades');
 
 local calculator = {};
 
+-- NM multiplier settings (can be overridden by addon settings)
+-- These mirror the server settings: NM_HP_MULTIPLIER, NM_STAT_MULTIPLIER
+calculator.Settings = {
+    NM_HP_MULTIPLIER = 1.0,   -- HP multiplier for Notorious Monsters (default: 1.0)
+    NM_STAT_MULTIPLIER = 1.0, -- Stat multiplier for NMs (affects ATK/DEF/EVA) (default: 1.0)
+};
+
+-- Allow addon to update settings
+function calculator.SetSettings(settings)
+    if (settings.nm_hp_multiplier) then
+        calculator.Settings.NM_HP_MULTIPLIER = settings.nm_hp_multiplier;
+    end
+    if (settings.nm_stat_multiplier) then
+        calculator.Settings.NM_STAT_MULTIPLIER = settings.nm_stat_multiplier;
+    end
+end
+
 -- Helper for SubJob Stats (Ported from GetSubJobStats in mobutils.cpp)
 local function GetSubJobStats(rank, level, stat)
     local sJobStat = 0;
@@ -82,6 +99,17 @@ local function GetSubJobStats(rank, level, stat)
 end
 
 function calculator.CalculateMaxHP(mobData, level)
+    -- Check for HP override from mob_groups (used for NMs like King Behemoth)
+    -- When HPOverride > 0, use it directly instead of calculating
+    if (mobData.HPOverride and mobData.HPOverride > 0) then
+        local hp = mobData.HPOverride;
+        -- Apply NM HP multiplier if this is an NM
+        if (mobData.IsNM and calculator.Settings.NM_HP_MULTIPLIER ~= 1.0) then
+            hp = hp * calculator.Settings.NM_HP_MULTIPLIER;
+        end
+        return math.floor(hp);
+    end
+
     local mJob          = mobData.Job;
     local sJob          = mobData.SubJob;
     local familyHPScale = mobData.HPScale or 100;      -- Default 100%
@@ -137,6 +165,11 @@ function calculator.CalculateMaxHP(mobData, level)
     -- Apply Family HP Scale (from mob_family_system.HP)
     -- The server divides by 100 to get a float (e.g. 120 -> 1.2)
     mobHP = mobHP * (familyHPScale / 100.0);
+
+    -- Apply NM HP multiplier if this is an NM (and formula was used, not override)
+    if (mobData.IsNM and calculator.Settings.NM_HP_MULTIPLIER ~= 1.0) then
+        mobHP = mobHP * calculator.Settings.NM_HP_MULTIPLIER;
+    end
 
     return math.floor(mobHP);
 end
@@ -206,6 +239,14 @@ function calculator.CalculateCombatStats(mobData, level, baseStats)
     local evaRank = mobData.EVA or 3;
     local evaBase = GetBaseDefEva(evaRank, level);
     combatStats.EVA = math.floor(evaBase + baseStats.AGI / 2);
+
+    -- Apply NM stat multiplier if this is an NM
+    if (mobData.IsNM and calculator.Settings.NM_STAT_MULTIPLIER ~= 1.0) then
+        local mult = calculator.Settings.NM_STAT_MULTIPLIER;
+        combatStats.ATK = math.floor(combatStats.ATK * mult);
+        combatStats.DEF = math.floor(combatStats.DEF * mult);
+        combatStats.EVA = math.floor(combatStats.EVA * mult);
+    end
 
     return combatStats;
 end

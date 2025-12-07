@@ -137,6 +137,9 @@ function database:Initialize()
     end
 
     -- Load Pools (Global) - index by both ID and name for flexible lookup
+    -- Columns: 1=poolid, 2=name, 3=packet_name, 4=familyid, 5=modelid, 6=mJob, 7=sJob,
+    --          8=cmbSkill, 9=cmbDelay, 10=cmbDmgMult, 11=behavior, 12=aggro, 13=true_detection,
+    --          14=links, 15=mobType, ...
     if (next(self.Pools) == nil) then
         print('[EnemyStats] Loading pools...');
         self.PoolsByName = {}; -- Additional index by name
@@ -145,6 +148,7 @@ function database:Initialize()
             if (id) then
                 local name = parts[2];
                 local familyId = tonumber(parts[4]);
+                local mobType = tonumber(parts[15]) or 0;
 
                 local poolData = {
                     PoolId = id,
@@ -154,7 +158,9 @@ function database:Initialize()
                     SubJob = tonumber(parts[7]),
                     Aggro = (parts[12] == '1'),
                     TrueSight = (tonumber(parts[13]) or 0) > 0,
-                    Link = (parts[14] == '1')
+                    Link = (parts[14] == '1'),
+                    MobType = mobType,
+                    IsNM = bit.band(mobType, 0x02) ~= 0 -- MOBTYPE_NOTORIOUS = 0x02
                 };
                 self.Pools[id] = poolData;
                 -- Also index by name for direct lookup
@@ -180,6 +186,8 @@ function database:Load(zone)
     print(string.format('[EnemyStats] Loading data for zone %d...', zone));
 
     -- Load Groups for this zone
+    -- Columns: 1=groupid, 2=poolid, 3=zoneid, 4=name, 5=respawntime, 6=spawntype, 7=dropid,
+    --          8=HP (override), 9=MP (override), 10=minLevel, 11=maxLevel, 12=allegiance
     ParseSQL('mob_groups.sql', function(parts)
         local id = tonumber(parts[1]);
         local zoneId = tonumber(parts[3]);
@@ -187,6 +195,8 @@ function database:Load(zone)
             self.Groups[id] = {
                 GroupId = id,
                 PoolId = tonumber(parts[2]),
+                HPOverride = tonumber(parts[8]) or 0, -- HP override (when > 0, use instead of formula)
+                MPOverride = tonumber(parts[9]) or 0, -- MP override (when > 0, use instead of formula)
                 MinLevel = tonumber(parts[10]),
                 MaxLevel = tonumber(parts[11])
             };
@@ -236,6 +246,9 @@ function database:Load(zone)
                 SubJob = pool and pool.SubJob or 0,
                 MinLevel = group.MinLevel,
                 MaxLevel = group.MaxLevel,
+                HPOverride = group.HPOverride or 0, -- HP override from mob_groups (when > 0, use instead of formula)
+                MPOverride = group.MPOverride or 0, -- MP override from mob_groups (when > 0, use instead of formula)
+                IsNM = pool and pool.IsNM or false, -- MOBTYPE_NOTORIOUS flag
                 Aggro = pool and pool.Aggro or false,
                 Link = pool and pool.Link or false,
                 TrueSight = pool and pool.TrueSight or false,
@@ -248,6 +261,10 @@ function database:Load(zone)
                 INT = family and family.INT or 3,
                 MND = family and family.MND or 3,
                 CHR = family and family.CHR or 3,
+                ATT = family and family.ATT or 3,
+                DEF = family and family.DEF or 3,
+                ACC = family and family.ACC or 3,
+                EVA = family and family.EVA or 3,
                 Detect = family and family.Detect or 0,
                 Resistances = resists
             };
@@ -260,6 +277,81 @@ function database:GetMob(index)
     if (self.Mobs and self.Mobs[index]) then
         return self.Mobs[index];
     end
+    return nil;
+end
+
+-- Fallback lookup by mob name (useful for dynamically spawned NMs not in spawn_points)
+-- This searches all loaded mobs in the current zone for a matching name
+-- If not found in current zone's mobs, falls back to pool data with estimated levels
+function database:GetMobByName(name)
+    if (not name) then
+        return nil;
+    end
+
+    -- Normalize name for comparison: underscores to spaces, lowercase
+    local searchName = name:gsub('_', ' '):lower();
+
+    -- First: search mobs in current zone by normalized name
+    if (self.Mobs) then
+        for _, mob in pairs(self.Mobs) do
+            if (mob.Name) then
+                -- Normalize database name the same way
+                local mobNameNorm = mob.Name:gsub('_', ' '):lower();
+                if (mobNameNorm == searchName) then
+                    return mob;
+                end
+            end
+        end
+    end
+
+    -- Second: search pools by name (for mobs not in spawn_points but defined in pools)
+    -- Try both original name and underscore-converted version
+    local pool = self.PoolsByName and self.PoolsByName[name];
+    if (not pool) then
+        -- Try with spaces replaced by underscores (database uses underscores)
+        local underscoreName = name:gsub(' ', '_');
+        pool = self.PoolsByName and self.PoolsByName[underscoreName];
+    end
+
+    if (pool) then
+        local family = self.Families and self.Families[pool.FamilyId];
+        local resists = self.Resistances and self.Resistances[pool.FamilyId];
+
+        -- Create a synthetic mob entry from pool data
+        -- Note: MinLevel/MaxLevel and HP/MP overrides are unknown for pool-only mobs
+        -- We use 75 as a sensible default for ITG mobs (NMs)
+        return {
+            Id = 0, -- Unknown
+            Name = pool.Name,
+            Job = pool.Job or 0,
+            SubJob = pool.SubJob or 0,
+            MinLevel = 75,             -- Default for NMs (user can /check to get exact level for non-ITG)
+            MaxLevel = 75,             -- ITG mobs are typically 75+ era NMs
+            HPOverride = 0,            -- Unknown for pool-only lookup (no mob_groups data)
+            MPOverride = 0,            -- Unknown for pool-only lookup
+            IsNM = pool.IsNM or false, -- From pool's mobType flag
+            Aggro = pool.Aggro or false,
+            Link = pool.Link or false,
+            TrueSight = pool.TrueSight or false,
+            Family = family and family.FamilyName or 'Unknown',
+            HPScale = family and family.HP or 100,
+            STR = family and family.STR or 3,
+            DEX = family and family.DEX or 3,
+            VIT = family and family.VIT or 3,
+            AGI = family and family.AGI or 3,
+            INT = family and family.INT or 3,
+            MND = family and family.MND or 3,
+            CHR = family and family.CHR or 3,
+            ATT = family and family.ATT or 3,
+            DEF = family and family.DEF or 3,
+            ACC = family and family.ACC or 3,
+            EVA = family and family.EVA or 3,
+            Detect = family and family.Detect or 0,
+            Resistances = resists,
+            _fromPool = true -- Flag to indicate this is synthetic data (no HP override available)
+        };
+    end
+
     return nil;
 end
 
