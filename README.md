@@ -1,4 +1,4 @@
-# Enemy Stats - Ashita v4 Addon
+# Enemy Stats - Ashita v4 Addon (Built for LSB private servers only)
 
 An Ashita v4 addon for Final Fantasy XI that displays detailed enemy statistics including combat stats, resistances, and your calculated hit rate.
 
